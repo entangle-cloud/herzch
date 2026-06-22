@@ -1,7 +1,9 @@
 /**
  * Entangle Keyboard Telemetry
  * Drop this script into any page Georg is testing.
- * It injects a diagnostic panel fixed to the bottom of the page.
+ * Injects a diagnostic panel fixed to the bottom of the page.
+ * Detects keyboard layout via Keyboard Layout API (Chrome/Edge)
+ * or infers it from live key events (Safari/Firefox fallback).
  */
 
 (function (global) {
@@ -10,28 +12,30 @@
   // ── State ───────────────────────────────────────────────────────────────────
 
   const session = {
-    startedAt: new Date().toISOString(),
-    browser: null,
-    os: null,
-    platform: null,
-    userAgent: null,
-    languages: [],
-    keyboardLayoutAPI: null,
-    layoutMap: {},
-    swapDetected: false,
+    startedAt        : new Date().toISOString(),
+    browser          : null,
+    os               : null,
+    platform         : null,
+    userAgent        : null,
+    languages        : [],
+    keyboardLayoutAPI: null,   // 'supported' | 'not_supported' | 'permission_denied'
+    layoutMap        : {},     // code → character (from API)
+    detectedLayout   : null,   // inferred name e.g. 'QWERTZ', 'AZERTY', 'QWERTY'
+    layoutSource     : null,   // 'keyboard_layout_api' | 'key_events'
+    swapDetected     : false,
   };
 
   const keyEvents = [];
   const listeners = [];
 
-  // ── Detection helpers ───────────────────────────────────────────────────────
+  // ── Browser / OS detection ──────────────────────────────────────────────────
 
   function detectBrowser(ua) {
-    if (ua.includes('Edg/'))     return 'Edge '    + (ua.match(/Edg\/([\d.]+)/)    || [])[1];
-    if (ua.includes('Chrome/'))  return 'Chrome '  + (ua.match(/Chrome\/([\d.]+)/) || [])[1];
-    if (ua.includes('Firefox/')) return 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/)|| [])[1];
+    if (ua.includes('Edg/'))    return 'Edge '    + (ua.match(/Edg\/([\d.]+)/)    || [])[1];
+    if (ua.includes('Chrome/')) return 'Chrome '  + (ua.match(/Chrome\/([\d.]+)/) || [])[1];
+    if (ua.includes('Firefox/'))return 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/)|| [])[1];
     if (ua.includes('Safari/') && !ua.includes('Chrome'))
-                                 return 'Safari '  + (ua.match(/Version\/([\d.]+)/)|| [])[1];
+                                return 'Safari '  + (ua.match(/Version\/([\d.]+)/)|| [])[1];
     return 'Unknown';
   }
 
@@ -42,6 +46,54 @@
     if (/iPhone|iPad/.test(ua))     return 'iOS';
     if (/Android/.test(ua))         return 'Android';
     return platform || 'Unknown';
+  }
+
+  // ── Layout name inference ───────────────────────────────────────────────────
+  // Uses a fingerprint of known physical→character mappings to name the layout.
+
+  const LAYOUT_FINGERPRINTS = [
+    // Each entry: [ layoutName, [ [code, expectedChar], ... ] ]
+    // More specific fingerprints first.
+    ['QWERTZ (Swiss/DE/AT)', [['KeyZ','z'],['KeyY','y'],['KeyZ','z']]],  // checked via swap flags
+    ['AZERTY (FR/BE)',       [['KeyQ','a'],['KeyW','z'],['KeyA','q']]],
+    ['Dvorak',               [['KeyQ','\''],['KeyW',','],['KeyE','.'],['KeyR','p']]],
+    ['Colemak',              [['KeyS','r'],['KeyD','s'],['KeyF','t'],['KeyJ','n']]],
+    ['QWERTY',               [['KeyQ','q'],['KeyW','w'],['KeyZ','z'],['KeyY','y']]],
+  ];
+
+  function inferLayoutFromMap(map) {
+    // Direct Y/Z swap check first
+    const yChar = (map.get ? map.get('KeyY') : map['KeyY'] || '').toLowerCase();
+    const zChar = (map.get ? map.get('KeyZ') : map['KeyZ'] || '').toLowerCase();
+
+    if (zChar === 'y' && yChar === 'z') return 'QWERTZ (Swiss/DE/AT)';
+
+    // AZERTY check
+    const qChar = (map.get ? map.get('KeyQ') : map['KeyQ'] || '').toLowerCase();
+    const wChar = (map.get ? map.get('KeyW') : map['KeyW'] || '').toLowerCase();
+    if (qChar === 'a' && wChar === 'z') return 'AZERTY (FR/BE)';
+
+    // Dvorak
+    if (qChar === "'") return 'Dvorak';
+
+    // Colemak
+    const sChar = (map.get ? map.get('KeyS') : map['KeyS'] || '').toLowerCase();
+    if (sChar === 'r') return 'Colemak';
+
+    // Default
+    if (qChar === 'q' && wChar === 'w' && zChar === 'z') return 'QWERTY';
+
+    return 'Unknown';
+  }
+
+  // Infer from accumulated live key events (fallback for Safari/Firefox)
+  // Builds a synthetic map: { code → key } from keydown events.
+  const liveCodeMap = {};
+  const INFERENCE_THRESHOLD = 5; // number of distinct keys seen before we commit to a name
+
+  function inferLayoutFromEvents() {
+    if (Object.keys(liveCodeMap).length < INFERENCE_THRESHOLD) return null;
+    return inferLayoutFromMap(liveCodeMap);
   }
 
   // ── Keyboard Layout API ─────────────────────────────────────────────────────
@@ -56,281 +108,325 @@
       session.keyboardLayoutAPI = 'supported';
       map.forEach((value, code) => { session.layoutMap[code] = value; });
 
+      session.detectedLayout = inferLayoutFromMap(map);
+      session.layoutSource   = 'keyboard_layout_api';
+
       const yKey = (map.get('KeyY') || '').toUpperCase();
       const zKey = (map.get('KeyZ') || '').toUpperCase();
-      if (yKey === 'Z' || zKey === 'Y') {
-        session.swapDetected = true;
-      }
+      if (yKey === 'Z' || zKey === 'Y') session.swapDetected = true;
+
     } catch (_) {
       session.keyboardLayoutAPI = 'permission_denied';
     }
   }
 
-  // ── Key event classification ────────────────────────────────────────────────
+  // ── Key event recording ─────────────────────────────────────────────────────
 
   function classify(e) {
     if (e.code !== 'KeyY' && e.code !== 'KeyZ') return 'other';
     const expected = e.code === 'KeyY' ? 'Y' : 'Z';
     const actual   = e.key.toUpperCase();
-    if (actual === expected)                                        return 'consistent';
+    if (actual === expected) return 'consistent';
     if ((e.code === 'KeyZ' && actual === 'Y') ||
-        (e.code === 'KeyY' && actual === 'Z'))                      return 'swap';
+        (e.code === 'KeyY' && actual === 'Z')) return 'swap';
     return 'other';
   }
 
   function recordEvent(e) {
     if (e.type !== 'keydown') return;
-    const entry = {
-      ts           : new Date().toLocaleTimeString(),
-      key          : e.key,
-      code         : e.code,
-      keyCode      : e.keyCode,
-      classification: classify(e),
-    };
-    if (entry.classification === 'swap') session.swapDetected = true;
-    keyEvents.unshift(entry);
+
+    // Feed live code map for layout inference fallback
+    if (e.code && e.key && e.key.length === 1) {
+      liveCodeMap[e.code] = e.key.toLowerCase();
+    }
+
+    // If Layout API wasn't available, try to infer from events
+    if (session.keyboardLayoutAPI !== 'supported') {
+      const inferred = inferLayoutFromEvents();
+      if (inferred && inferred !== session.detectedLayout) {
+        session.detectedLayout = inferred;
+        session.layoutSource   = 'key_events';
+        updateLayoutDisplay();
+      }
+    }
+
+    const classification = classify(e);
+    if (classification === 'swap') session.swapDetected = true;
+
+    keyEvents.unshift({
+      ts            : new Date().toLocaleTimeString(),
+      key           : e.key,
+      code          : e.code,
+      keyCode       : e.keyCode,
+      classification,
+    });
     if (keyEvents.length > 50) keyEvents.pop();
+
     updatePanel();
   }
 
-  // ── UI ──────────────────────────────────────────────────────────────────────
+  // ── DOM helpers ─────────────────────────────────────────────────────────────
 
-  let panel, evtBody, bannerEl, klGrid;
+  function el(tag, css, html) {
+    const e = document.createElement(tag);
+    if (css)  e.style.cssText = css;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Panel ───────────────────────────────────────────────────────────────────
+
+  let panel, evtBody, bannerEl, klGrid, layoutNameEl, layoutSourceEl, statusDot;
   let collapsed = false;
 
-  const S = {
-    panel: `
-      position:fixed;bottom:0;left:0;right:0;z-index:999999;
-      background:#fff;border-top:1.5px solid #e2e2e2;
-      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-      font-size:13px;color:#1a1a1a;box-shadow:0 -4px 24px rgba(0,0,0,.08);
-      transition:transform .2s ease;`,
-    header: `
-      display:flex;align-items:center;justify-content:space-between;
-      padding:8px 16px;border-bottom:1px solid #ebebeb;
-      background:#fafafa;cursor:pointer;user-select:none;`,
-    headerLeft: `display:flex;align-items:center;gap:10px;`,
-    dot: (color) => `
-      width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0;`,
-    title: `font-weight:600;font-size:13px;`,
-    collapseBtn: `
-      background:none;border:1px solid #d4d4d4;border-radius:6px;
-      padding:3px 10px;font-size:12px;cursor:pointer;color:#555;`,
-    copyBtn: `
-      background:none;border:1px solid #d4d4d4;border-radius:6px;
-      padding:3px 10px;font-size:12px;cursor:pointer;color:#555;margin-right:6px;`,
-    body: `display:flex;gap:0;overflow:hidden;`,
-    col: `flex:1;padding:12px 16px;border-right:1px solid #ebebeb;min-width:0;`,
-    colLast: `flex:1;padding:12px 16px;min-width:0;`,
-    label: `font-size:10px;font-weight:600;color:#888;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;`,
-    grid2: `display:grid;grid-template-columns:1fr 1fr;gap:6px;`,
-    stat: `background:#f5f5f5;border-radius:6px;padding:6px 10px;`,
-    statLabel: `font-size:10px;color:#888;margin-bottom:2px;`,
-    statVal: `font-size:12px;font-weight:500;word-break:break-all;`,
-    banner: (bg, color) => `
-      border-radius:6px;padding:7px 12px;font-size:12px;margin-bottom:10px;
-      background:${bg};color:${color};font-weight:500;`,
-    evtTable: `width:100%;border-collapse:collapse;font-size:11px;`,
-    evtTh: `text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;`,
-    evtTd: `padding:4px 6px 4px 0;border-bottom:1px solid #f0f0f0;font-family:monospace;`,
-    badge: (bg, color) => `
-      display:inline-block;padding:2px 7px;border-radius:4px;
-      font-size:10px;font-weight:600;background:${bg};color:${color};`,
-    langBadge: `
-      display:inline-block;padding:2px 8px;border-radius:4px;
-      font-size:11px;background:#f0f0f0;color:#555;margin:2px 3px 2px 0;`,
-    klCell: `
-      background:#f5f5f5;border-radius:6px;padding:6px 10px;
-      display:inline-flex;flex-direction:column;margin:2px;min-width:72px;`,
+  const COLORS = {
+    warn  : { bg:'#fff3cd', text:'#856404' },
+    ok    : { bg:'#d1f2d1', text:'#155724' },
+    neutral:{ bg:'#f0f0f0', text:'#555'    },
   };
 
-  function el(tag, style, html) {
-    const e = document.createElement(tag);
-    if (style) e.style.cssText = style;
-    if (html  !== undefined) e.innerHTML = html;
-    return e;
+  function badge(label, c) {
+    return `<span style="display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;background:${c.bg};color:${c.text};">${label}</span>`;
   }
 
   function createPanel() {
-    panel = el('div', S.panel);
+    panel = el('div', `
+      position:fixed;bottom:0;left:0;right:0;z-index:999999;
+      background:#fff;border-top:1.5px solid #e2e2e2;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      font-size:13px;color:#1a1a1a;
+      box-shadow:0 -4px 24px rgba(0,0,0,.08);`);
 
-    // ── Header ─────────────────────────────────────────────────────────────
-    const header = el('div', S.header);
-    const hLeft  = el('div', S.headerLeft);
+    // ── Header ────────────────────────────────────────────────────────────
+    const header = el('div',`
+      display:flex;align-items:center;justify-content:space-between;
+      padding:8px 16px;border-bottom:1px solid #ebebeb;
+      background:#fafafa;cursor:pointer;user-select:none;`);
 
-    const statusDot = el('span', S.dot('#ccc'));
-    const titleEl   = el('span', S.title, '⌨ Entangle Keyboard Telemetry');
+    statusDot = el('span',`
+      width:8px;height:8px;border-radius:50%;
+      background:#ccc;flex-shrink:0;margin-right:10px;`);
+
+    const titleEl = el('span','font-weight:600;font-size:13px;','⌨ Entangle Keyboard Telemetry');
+    const hLeft   = el('div','display:flex;align-items:center;');
     hLeft.append(statusDot, titleEl);
 
-    const hRight = el('div', 'display:flex;align-items:center;gap:6px;');
-    const copyBtn = el('button', S.copyBtn, '⎘ Copy report');
-    copyBtn.onclick = (e) => {
-      e.stopPropagation();
+    const hRight  = el('div','display:flex;align-items:center;gap:6px;');
+    const copyBtn = el('button',`
+      background:none;border:1px solid #d4d4d4;border-radius:6px;
+      padding:3px 10px;font-size:12px;cursor:pointer;color:#555;`,'⎘ Copy report');
+    copyBtn.onclick = ev => {
+      ev.stopPropagation();
       navigator.clipboard.writeText(getReportJSON()).then(() => {
         copyBtn.textContent = 'Copied!';
         setTimeout(() => { copyBtn.innerHTML = '⎘ Copy report'; }, 1500);
       });
     };
-    const colBtn = el('button', S.collapseBtn, '▼ Collapse');
-    colBtn.onclick = (e) => {
-      e.stopPropagation();
+    const colBtn = el('button',`
+      background:none;border:1px solid #d4d4d4;border-radius:6px;
+      padding:3px 10px;font-size:12px;cursor:pointer;color:#555;`,'▼ Collapse');
+    colBtn.onclick = ev => {
+      ev.stopPropagation();
       collapsed = !collapsed;
       bodyEl.style.display = collapsed ? 'none' : 'flex';
-      colBtn.textContent = collapsed ? '▲ Expand' : '▼ Collapse';
+      colBtn.textContent   = collapsed ? '▲ Expand' : '▼ Collapse';
     };
     hRight.append(copyBtn, colBtn);
     header.append(hLeft, hRight);
     panel.appendChild(header);
 
-    // ── Body ────────────────────────────────────────────────────────────────
-    const bodyEl = el('div', S.body);
-    bodyEl.style.maxHeight = '200px';
+    // ── Body ──────────────────────────────────────────────────────────────
+    const bodyEl = el('div','display:flex;gap:0;max-height:200px;overflow:hidden;');
 
-    // Col 1 — system info
-    const col1 = el('div', S.col);
-    col1.innerHTML = `<div style="${S.label}">System</div>`;
-    const g = el('div', S.grid2);
+    // Col 1 — System + detected layout
+    const col1 = el('div','flex:1;padding:12px 16px;border-right:1px solid #ebebeb;min-width:0;');
+    col1.innerHTML = `<div style="font-size:10px;font-weight:600;color:#888;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;">System</div>`;
 
-    const statBrowser = el('div', S.stat);
-    statBrowser.innerHTML = `<div style="${S.statLabel}">Browser</div><div style="${S.statVal}" id="et-browser">—</div>`;
-    const statOS = el('div', S.stat);
-    statOS.innerHTML = `<div style="${S.statLabel}">OS</div><div style="${S.statVal}" id="et-os">—</div>`;
-    const statLAPI = el('div', S.stat);
-    statLAPI.innerHTML = `<div style="${S.statLabel}">Layout API</div><div style="${S.statVal}" id="et-lapi">—</div>`;
-    const statLangs = el('div', S.stat);
-    statLangs.innerHTML = `<div style="${S.statLabel}">Languages</div><div style="${S.statVal}" id="et-langs">—</div>`;
+    const g = el('div','display:grid;grid-template-columns:1fr 1fr;gap:6px;');
 
-    g.append(statBrowser, statOS, statLAPI, statLangs);
+    function statBox(label, id) {
+      const b = el('div','background:#f5f5f5;border-radius:6px;padding:6px 10px;');
+      b.innerHTML = `<div style="font-size:10px;color:#888;margin-bottom:2px;">${label}</div>
+                     <div style="font-size:12px;font-weight:500;word-break:break-all;" id="${id}">—</div>`;
+      return b;
+    }
+
+    g.append(
+      statBox('Browser',     'et-browser'),
+      statBox('OS',          'et-os'),
+      statBox('Languages',   'et-langs'),
+      statBox('Layout API',  'et-lapi'),
+    );
     col1.appendChild(g);
+
+    // Detected layout — prominent row
+    const layoutRow = el('div',`
+      margin-top:8px;background:#f5f5f5;border-radius:6px;
+      padding:8px 10px;display:flex;align-items:center;justify-content:space-between;`);
+    const layoutLeft = el('div','');
+    layoutLeft.innerHTML = `<div style="font-size:10px;color:#888;margin-bottom:3px;">Detected keyboard layout</div>`;
+    layoutNameEl   = el('div','font-size:15px;font-weight:600;color:#1a1a1a;','Detecting…');
+    layoutSourceEl = el('div','font-size:10px;color:#aaa;margin-top:2px;','');
+    layoutLeft.append(layoutNameEl, layoutSourceEl);
+    layoutRow.appendChild(layoutLeft);
+    col1.appendChild(layoutRow);
+
     bodyEl.appendChild(col1);
 
-    // Col 2 — layout map
-    const col2 = el('div', S.col);
-    col2.innerHTML = `<div style="${S.label}">Keyboard layout map</div>`;
-    bannerEl = el('div', '');
-    klGrid   = el('div', 'display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;');
+    // Col 2 — Layout map grid
+    const col2 = el('div','flex:1;padding:12px 16px;border-right:1px solid #ebebeb;min-width:0;overflow-y:auto;');
+    col2.innerHTML = `<div style="font-size:10px;font-weight:600;color:#888;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;">Physical key → character map</div>`;
+    bannerEl = el('div','margin-bottom:8px;');
+    klGrid   = el('div','display:flex;flex-wrap:wrap;gap:4px;');
     col2.append(bannerEl, klGrid);
     bodyEl.appendChild(col2);
 
-    // Col 3 — live key events
-    const col3 = el('div', S.colLast);
-    col3.innerHTML = `<div style="${S.label}">Live key events — click in the chatbot and type Y or Z</div>`;
-    const tableWrap = el('div', 'overflow-y:auto;max-height:140px;');
-    const table = el('table', S.evtTable);
-    table.innerHTML = `<thead><tr>
-      <th style="${S.evtTh}">Time</th>
-      <th style="${S.evtTh}">event.key</th>
-      <th style="${S.evtTh}">event.code</th>
-      <th style="${S.evtTh}">keyCode</th>
-      <th style="${S.evtTh}">Verdict</th>
+    // Col 3 — Live events
+    const col3 = el('div','flex:1.2;padding:12px 16px;min-width:0;');
+    col3.innerHTML = `<div style="font-size:10px;font-weight:600;color:#888;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;">Live key events — type in the chatbot</div>`;
+    const tw = el('div','overflow-y:auto;max-height:152px;');
+    const tbl = el('table','width:100%;border-collapse:collapse;font-size:11px;');
+    tbl.innerHTML = `<thead><tr>
+      <th style="text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;">Time</th>
+      <th style="text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;">event.key</th>
+      <th style="text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;">event.code</th>
+      <th style="text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;">keyCode</th>
+      <th style="text-align:left;color:#888;font-weight:600;font-size:10px;padding:0 6px 5px 0;border-bottom:1px solid #ebebeb;">Verdict</th>
     </tr></thead>`;
-    evtBody = el('tbody', '');
+    evtBody = el('tbody','');
     evtBody.innerHTML = `<tr><td colspan="5" style="color:#aaa;padding:6px 0;font-size:11px;">No keypresses yet…</td></tr>`;
-    table.appendChild(evtBody);
-    tableWrap.appendChild(table);
-    col3.appendChild(tableWrap);
+    tbl.appendChild(evtBody);
+    tw.appendChild(tbl);
+    col3.appendChild(tw);
     bodyEl.appendChild(col3);
 
     panel.appendChild(bodyEl);
     document.body.appendChild(panel);
 
-    // store refs
-    panel._statusDot = statusDot;
-    panel._bodyEl    = bodyEl;
+    // store ref for collapse toggle
+    colBtn._bodyEl = bodyEl;
+    colBtn.onclick = ev => {
+      ev.stopPropagation();
+      collapsed = !collapsed;
+      bodyEl.style.display = collapsed ? 'none' : 'flex';
+      colBtn.textContent   = collapsed ? '▲ Expand' : '▼ Collapse';
+    };
 
     populateStatic();
   }
 
   function populateStatic() {
-    const b = document.getElementById('et-browser');
-    const o = document.getElementById('et-os');
-    const l = document.getElementById('et-lapi');
-    const g = document.getElementById('et-langs');
-    if (b) b.textContent = session.browser;
-    if (o) o.textContent = session.os;
-    if (l) l.textContent = session.keyboardLayoutAPI;
-    if (g) g.textContent = session.languages.slice(0, 3).join(', ');
+    const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val || '—'; };
+    set('et-browser', session.browser);
+    set('et-os',      session.os);
+    set('et-langs',   session.languages.slice(0,3).join(', '));
+    set('et-lapi',    session.keyboardLayoutAPI);
     renderLayoutMap();
+    updateLayoutDisplay();
     updateBanner();
   }
 
   function renderLayoutMap() {
     if (!klGrid) return;
     klGrid.innerHTML = '';
-    const notable = ['KeyY','KeyZ','KeyQ','KeyW','KeyA','KeyS','KeyX','KeyC'];
+    const notable = ['KeyQ','KeyW','KeyE','KeyR','KeyT','KeyY','KeyZ','KeyU',
+                     'KeyA','KeyS','KeyD','KeyF','KeyX','KeyC','KeyV','KeyB'];
+    let hasAny = false;
     notable.forEach(code => {
       const val = session.layoutMap[code];
       if (!val) return;
-      const isSwap = (code === 'KeyZ' && val.toUpperCase() === 'Y') ||
-                     (code === 'KeyY' && val.toUpperCase() === 'Z');
-      const cell = el('div', S.klCell);
+      hasAny = true;
+      const isSwap = (code === 'KeyZ' && val.toLowerCase() === 'y') ||
+                     (code === 'KeyY' && val.toLowerCase() === 'z');
+      const cell = el('div',`
+        background:${isSwap ? '#fff3cd' : '#f5f5f5'};border-radius:6px;
+        padding:5px 9px;display:inline-flex;flex-direction:column;min-width:52px;
+        border:1px solid ${isSwap ? '#f0c040' : 'transparent'};`);
       cell.innerHTML =
-        `<span style="font-size:9px;color:#888;margin-bottom:2px;">${code}</span>` +
-        `<span style="font-size:18px;font-weight:600;color:${isSwap ? '#c0392b' : '#1a1a1a'};">${val}${isSwap ? ' ⚠' : ''}</span>`;
+        `<span style="font-size:9px;color:#888;margin-bottom:2px;">${code.replace('Key','')}</span>` +
+        `<span style="font-size:17px;font-weight:600;color:${isSwap ? '#b45309' : '#1a1a1a'};">${esc(val)}</span>`;
       klGrid.appendChild(cell);
     });
+    if (!hasAny) {
+      klGrid.innerHTML = `<span style="font-size:12px;color:#aaa;">Not available — will infer from typed keys</span>`;
+    }
+  }
 
-    if (!klGrid.children.length) {
-      klGrid.innerHTML = `<span style="font-size:12px;color:#aaa;">Not available in this browser</span>`;
+  function updateLayoutDisplay() {
+    if (!layoutNameEl) return;
+    const name   = session.detectedLayout;
+    const source = session.layoutSource;
+    if (name) {
+      layoutNameEl.textContent = name;
+      layoutNameEl.style.color = name.includes('QWERTZ') ? '#b45309' : '#1a1a1a';
+      layoutSourceEl.textContent = source === 'keyboard_layout_api'
+        ? 'via Keyboard Layout API'
+        : 'inferred from live key events';
+    } else {
+      layoutNameEl.textContent   = 'Detecting…';
+      layoutNameEl.style.color   = '#aaa';
+      layoutSourceEl.textContent = session.keyboardLayoutAPI === 'not_supported'
+        ? 'type a few keys to detect layout (Safari/Firefox)'
+        : '';
     }
   }
 
   function updateBanner() {
     if (!bannerEl) return;
+    let c, msg;
     if (session.swapDetected) {
-      bannerEl.style.cssText = S.banner('#fff3cd', '#856404');
-      bannerEl.innerHTML = '⚠ Y/Z swap detected — widget is reading physical key position instead of logical character.';
-    } else if (session.keyboardLayoutAPI === 'supported') {
-      bannerEl.style.cssText = S.banner('#d1f2d1', '#155724');
-      bannerEl.innerHTML = '✓ No swap detected via Layout API.';
+      c = COLORS.warn;
+      msg = '⚠ Y/Z swap confirmed — the widget reads physical key position (event.code / keyCode) instead of the logical character (event.key).';
+    } else if (session.detectedLayout) {
+      c = session.detectedLayout.includes('QWERTZ') ? COLORS.warn : COLORS.ok;
+      msg = session.detectedLayout.includes('QWERTZ')
+        ? '⚠ QWERTZ layout detected — Y/Z swap is likely unless event.key is used.'
+        : '✓ Layout looks QWERTY-compatible — no swap expected.';
     } else {
-      bannerEl.style.cssText = S.banner('#f0f0f0', '#555');
-      bannerEl.innerHTML = 'Type Y or Z in the chatbot to detect swap via live events.';
+      c = COLORS.neutral;
+      msg = 'Type in the chatbot to verify.';
     }
-    if (panel && panel._statusDot) {
-      panel._statusDot.style.background = session.swapDetected ? '#e74c3c' : '#27ae60';
-    }
+    bannerEl.style.cssText = `border-radius:6px;padding:7px 12px;font-size:12px;background:${c.bg};color:${c.text};font-weight:500;`;
+    bannerEl.textContent = msg;
+    if (statusDot) statusDot.style.background = session.swapDetected ? '#e74c3c' : (session.detectedLayout ? '#27ae60' : '#ccc');
   }
 
   function updatePanel() {
     if (!evtBody) return;
     if (keyEvents.length === 1) evtBody.innerHTML = '';
 
-    const e = keyEvents[0];
+    const e   = keyEvents[0];
+    const tdS = 'padding:4px 6px 4px 0;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:11px;';
     const isSwap = e.classification === 'swap';
     const isYZ   = e.classification !== 'other';
+    const b = isSwap ? badge('Y/Z swap', COLORS.warn) : isYZ ? badge('OK', COLORS.ok) : badge('other', COLORS.neutral);
 
-    let badge = '';
-    if (isSwap)       badge = `<span style="${S.badge('#fff3cd','#856404')}">Y/Z swap</span>`;
-    else if (isYZ)    badge = `<span style="${S.badge('#d1f2d1','#155724')}">OK</span>`;
-    else              badge = `<span style="${S.badge('#f0f0f0','#555')}">other</span>`;
-
-    const row = el('tr', '');
+    const row = el('tr','');
     row.innerHTML =
-      `<td style="${S.evtTd}">${e.ts}</td>` +
-      `<td style="${S.evtTd};font-weight:600;">${esc(e.key)}</td>` +
-      `<td style="${S.evtTd};color:#555;">${esc(e.code)}</td>` +
-      `<td style="${S.evtTd};color:#555;">${e.keyCode}</td>` +
-      `<td style="${S.evtTd}">${badge}</td>`;
+      `<td style="${tdS}">${esc(e.ts)}</td>` +
+      `<td style="${tdS}font-weight:600;">${esc(e.key)}</td>` +
+      `<td style="${tdS}color:#555;">${esc(e.code)}</td>` +
+      `<td style="${tdS}color:#555;">${e.keyCode}</td>` +
+      `<td style="${tdS}">${b}</td>`;
 
     evtBody.insertBefore(row, evtBody.firstChild);
     if (evtBody.children.length > 12) evtBody.removeChild(evtBody.lastChild);
 
+    updateLayoutDisplay();
     updateBanner();
   }
 
-  function esc(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  // ── Telemetry public API ────────────────────────────────────────────────────
+  // ── Public API ──────────────────────────────────────────────────────────────
 
   function attach(selector) {
     const target = selector
       ? (typeof selector === 'string' ? document.querySelector(selector) : selector)
       : document;
     if (!target) return;
-    const h = (e) => recordEvent(e);
+    const h = e => recordEvent(e);
     ['keydown','keyup','keypress'].forEach(t => {
       target.addEventListener(t, h, true);
       listeners.push({ target, type: t, handler: h });
@@ -363,14 +459,12 @@
     session.languages = Array.from(navigator.languages || [navigator.language]);
 
     await loadLayoutMap();
-
-    attach(); // listen globally by default
+    attach(); // listen globally
 
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => { createPanel(); populateStatic(); });
+      document.addEventListener('DOMContentLoaded', () => { createPanel(); });
     } else {
       createPanel();
-      populateStatic();
     }
   })();
 
