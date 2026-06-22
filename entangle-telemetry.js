@@ -384,15 +384,15 @@
     let c, msg;
     if (session.swapDetected) {
       c = COLORS.warn;
-      msg = '⚠ Y/Z swap confirmed — the widget reads physical key position (event.code / keyCode) instead of the logical character (event.key).';
+      msg = '⚠ Issue confirmed — your keyboard is set to German/Swiss layout but the chatbot is not recognising it correctly. Please copy the report and send it to Rukshan.';
     } else if (session.detectedLayout) {
       c = session.detectedLayout.includes('QWERTZ') ? COLORS.warn : COLORS.ok;
       msg = session.detectedLayout.includes('QWERTZ')
-        ? '⚠ QWERTZ layout detected — Y/Z swap is likely unless event.key is used.'
-        : '✓ Layout looks QWERTY-compatible — no swap expected.';
+        ? '⚠ German/Swiss keyboard layout detected — please type Y and Z in the chatbot below to confirm the issue, then copy the report and send it.'
+        : '✓ Your keyboard layout looks correct — no issues detected. If you are still seeing wrong characters, please type Y and Z in the chatbot and copy the report.';
     } else {
       c = COLORS.neutral;
-      msg = 'Type in the chatbot to verify.';
+      msg = 'Please type a few characters in the chatbot below so we can check your keyboard layout.';
     }
     bannerEl.style.cssText = `border-radius:6px;padding:7px 12px;font-size:12px;background:${c.bg};color:${c.text};font-weight:500;`;
     bannerEl.textContent = msg;
