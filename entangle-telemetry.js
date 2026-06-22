@@ -216,13 +216,18 @@
 
     const hRight  = el('div','display:flex;align-items:center;gap:6px;');
     const copyBtn = el('button',`
-      background:none;border:1px solid #d4d4d4;border-radius:6px;
-      padding:3px 10px;font-size:12px;cursor:pointer;color:#555;`,'⎘ Copy report');
+      background:#1a1a1a;border:none;border-radius:6px;
+      padding:5px 14px;font-size:12px;font-weight:600;
+      cursor:pointer;color:#fff;letter-spacing:.01em;`,'📋 Copy report');
     copyBtn.onclick = ev => {
       ev.stopPropagation();
       navigator.clipboard.writeText(getReportJSON()).then(() => {
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.innerHTML = '⎘ Copy report'; }, 1500);
+        copyBtn.textContent = '✓ Copied!';
+        copyBtn.style.background = '#27ae60';
+        setTimeout(() => {
+          copyBtn.innerHTML = '📋 Copy report';
+          copyBtn.style.background = '#1a1a1a';
+        }, 1500);
       });
     };
     const colBtn = el('button',`
