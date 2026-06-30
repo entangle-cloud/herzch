@@ -110,10 +110,10 @@
 
       session.detectedLayout = inferLayoutFromMap(map);
       session.layoutSource   = 'keyboard_layout_api';
-
-      const yKey = (map.get('KeyY') || '').toUpperCase();
-      const zKey = (map.get('KeyZ') || '').toUpperCase();
-      if (yKey === 'Z' || zKey === 'Y') session.swapDetected = true;
+      // NOTE: a QWERTZ layout is normal and expected for CH/DE/AT users.
+      // It is NOT itself a bug — only a mismatch between what the OS layout
+      // map says a key produces and what the browser actually reports via
+      // event.key (checked live in classify()) indicates a real issue.
 
     } catch (_) {
       session.keyboardLayoutAPI = 'permission_denied';
@@ -124,12 +124,21 @@
 
   function classify(e) {
     if (e.code !== 'KeyY' && e.code !== 'KeyZ') return 'other';
-    const expected = e.code === 'KeyY' ? 'Y' : 'Z';
-    const actual   = e.key.toUpperCase();
-    if (actual === expected) return 'consistent';
-    if ((e.code === 'KeyZ' && actual === 'Y') ||
-        (e.code === 'KeyY' && actual === 'Z')) return 'swap';
-    return 'other';
+
+    const actual = e.key.toLowerCase();
+
+    // Prefer the OS-reported layout map as ground truth for what this physical
+    // key SHOULD produce. Only available when keyboardLayoutAPI === 'supported'.
+    const osExpected = session.layoutMap[e.code];
+
+    if (osExpected) {
+      // Real bug: browser/app reports a different character than the OS layout says.
+      return actual === osExpected.toLowerCase() ? 'consistent' : 'mismatch';
+    }
+
+    // Fallback (no Layout API, e.g. Safari/Firefox): we don't know the OS's
+    // intended character yet, so we can't reliably call this a swap — just log it.
+    return 'unverified';
   }
 
   function recordEvent(e) {
@@ -151,7 +160,8 @@
     }
 
     const classification = classify(e);
-    if (classification === 'swap') session.swapDetected = true;
+    // Only a real OS-vs-browser MISMATCH counts as a confirmed issue.
+    if (classification === 'mismatch') session.swapDetected = true;
 
     keyEvents.unshift({
       ts            : new Date().toLocaleTimeString(),
@@ -344,15 +354,15 @@
       const val = session.layoutMap[code];
       if (!val) return;
       hasAny = true;
-      const isSwap = (code === 'KeyZ' && val.toLowerCase() === 'y') ||
-                     (code === 'KeyY' && val.toLowerCase() === 'z');
+      const isQwertz = (code === 'KeyZ' && val.toLowerCase() === 'y') ||
+                       (code === 'KeyY' && val.toLowerCase() === 'z');
       const cell = el('div',`
-        background:${isSwap ? '#fff3cd' : '#f5f5f5'};border-radius:6px;
+        background:${isQwertz ? '#e8f0fe' : '#f5f5f5'};border-radius:6px;
         padding:5px 9px;display:inline-flex;flex-direction:column;min-width:52px;
-        border:1px solid ${isSwap ? '#f0c040' : 'transparent'};`);
+        border:1px solid ${isQwertz ? '#a8c7fa' : 'transparent'};`);
       cell.innerHTML =
         `<span style="font-size:9px;color:#888;margin-bottom:2px;">${code.replace('Key','')}</span>` +
-        `<span style="font-size:17px;font-weight:600;color:${isSwap ? '#b45309' : '#1a1a1a'};">${esc(val)}</span>`;
+        `<span style="font-size:17px;font-weight:600;color:${isQwertz ? '#1967d2' : '#1a1a1a'};">${esc(val)}</span>`;
       klGrid.appendChild(cell);
     });
     if (!hasAny) {
@@ -366,7 +376,7 @@
     const source = session.layoutSource;
     if (name) {
       layoutNameEl.textContent = name;
-      layoutNameEl.style.color = name.includes('QWERTZ') ? '#b45309' : '#1a1a1a';
+      layoutNameEl.style.color = '#1a1a1a';
       layoutSourceEl.textContent = source === 'keyboard_layout_api'
         ? 'via Keyboard Layout API'
         : 'inferred from live key events';
@@ -382,21 +392,28 @@
   function updateBanner() {
     if (!bannerEl) return;
     let c, msg;
+    const hasYZEvents = keyEvents.some(e => e.code === 'KeyY' || e.code === 'KeyZ');
+
     if (session.swapDetected) {
       c = COLORS.warn;
-      msg = '⚠ Issue confirmed — your keyboard is set to German/Swiss layout but the chatbot is not recognising it correctly. Please copy the report and send it to Rukshan.';
+      msg = '⚠ Issue confirmed — your keyboard layout is correct, but the chatbot is showing the wrong character. Please copy the report and send it to Rukshan.';
+    } else if (hasYZEvents) {
+      c = COLORS.ok;
+      msg = '✓ No issue detected — the characters you typed match your keyboard layout correctly. If you are still seeing wrong characters elsewhere, please copy the report and send it to Rukshan anyway.';
     } else if (session.detectedLayout) {
-      c = session.detectedLayout.includes('QWERTZ') ? COLORS.warn : COLORS.ok;
-      msg = session.detectedLayout.includes('QWERTZ')
-        ? '⚠ German/Swiss keyboard layout detected — please type Y and Z in the chatbot below to confirm the issue, then copy the report and send it.'
-        : '✓ Your keyboard layout looks correct — no issues detected. If you are still seeing wrong characters, please type Y and Z in the chatbot and copy the report.';
+      c = COLORS.neutral;
+      msg = `Your keyboard layout (${session.detectedLayout}) was detected. Please type Y and Z in the chatbot below to check for issues, then copy the report and send it to Rukshan.`;
     } else {
       c = COLORS.neutral;
       msg = 'Please type a few characters in the chatbot below so we can check your keyboard layout.';
     }
     bannerEl.style.cssText = `border-radius:6px;padding:7px 12px;font-size:12px;background:${c.bg};color:${c.text};font-weight:500;`;
     bannerEl.textContent = msg;
-    if (statusDot) statusDot.style.background = session.swapDetected ? '#e74c3c' : (session.detectedLayout ? '#27ae60' : '#ccc');
+    if (statusDot) {
+      statusDot.style.background = session.swapDetected
+        ? '#e74c3c'
+        : (hasYZEvents ? '#27ae60' : '#ccc');
+    }
   }
 
   function updatePanel() {
@@ -405,9 +422,12 @@
 
     const e   = keyEvents[0];
     const tdS = 'padding:4px 6px 4px 0;border-bottom:1px solid #f0f0f0;font-family:monospace;font-size:11px;';
-    const isSwap = e.classification === 'swap';
-    const isYZ   = e.classification !== 'other';
-    const b = isSwap ? badge('Y/Z swap', COLORS.warn) : isYZ ? badge('OK', COLORS.ok) : badge('other', COLORS.neutral);
+    const cls = e.classification;
+    let b;
+    if (cls === 'mismatch')        b = badge('Wrong character', COLORS.warn);
+    else if (cls === 'consistent') b = badge('OK', COLORS.ok);
+    else if (cls === 'unverified') b = badge('Y/Z (unverified)', COLORS.neutral);
+    else                           b = badge('other', COLORS.neutral);
 
     const row = el('tr','');
     row.innerHTML =
